@@ -1,0 +1,275 @@
+# PrivacyGate 아키텍처 설계
+
+2026년 11월 15일 · 이세빈 · 증빙 확장·자동 검사·연락처 전달·회원 간 일정 합의 반영
+
+## 1. 한눈에 보기
+
+직원용 내부 영역과 회원용 외부 영역을 나누고, 두 영역 사이에는 중계 서버(transfer-api) 하나만 둔다. PrivacyGate 검사는 내부 API(자료를 만들기 전)와 중계 서버(자료를 내보내기 전) 두 곳에서 일어난다.
+
+![PrivacyGate 구성도](diagram.png)
+
+점선 상자는 Docker 네트워크로 나뉜 영역이다. external-api에서 업무 DB·증빙 저장소로 가는 선은 없으며, 모든 API는 Keycloak(realm `matchmaking`)으로 사용자를 확인하고 감사 로그를 Wazuh로 보낸다.
+
+## 2. 구성 요소와 책임
+
+| 서비스 | 영역 | 역할 | 기술 | 레포 |
+| --- | --- | --- | --- | --- |
+| internal-web | 내부 | 직원 화면: 회원 조회·반출 신청·증빙 심사·승인 | HTML/JS, Nginx | matchmaking-internal |
+| internal-api | 내부 | 업무 API, 직원 로그인(BFF), 역할·담당·동의 검사, 증빙 암호화 (**PrivacyGate**) | FastAPI | matchmaking-internal |
+| business-db | 내부 | `matchmaking_business`: 사용자·회원·담당·동의·증빙 메타·세션·감사 기록 | PostgreSQL 16 | privacygate/infra/db |
+| evidence-storage | 내부 | AES-GCM 암호화된 증빙 원본 | Docker 볼륨 | — |
+| transfer-api | 중계 | 반출 파일 검사, 신청·승인·회수, 전달 시 승인 파일 검증 (**PrivacyGate**) | FastAPI | matchmaking-external |
+| transfer-db | 중계 | `matchmaking_transfer`: 반출 파일·신청·승인·전달·감사 기록 | PostgreSQL 16 | privacygate/infra/db |
+| transfer-staging / transfer-verified | 중계 | 검사 전 파일 / 검사 통과 파일 | Docker 볼륨 | — |
+| external-api | 외부 | 회원 로그인(BFF), transfer-api만 호출 | FastAPI | matchmaking-external |
+| external-web | 외부 | 회원 화면: 증빙 제출·전달 목록·다운로드·거부·만료 안내 | HTML/JS, Nginx | matchmaking-external |
+| keycloak | 인증 | OIDC 로그인, 서비스 계정 | Keycloak 26 | privacygate/infra |
+| wazuh | 관제 | JSON 로그 수집·규칙·경보 | Wazuh 4 (선택 실행) | privacygate/infra |
+
+공통 보안 모듈 `privacygate`(Python 패키지)는 internal-api와 transfer-api가 함께 쓴다: 역할 판단, 직무 분리, 세션·CSRF 규칙, 오류 응답 형식, 감사 로그, 승인 파일 검증(`delivery_problem`), 기본 거부 경로 검사.
+
+## 3. 네트워크 분리
+
+명칭 규칙의 세 망(business-net, transfer-net, external-net)에 서비스 쌍마다 보조 망을 더했다. public-\*을 뺀 망은 모두 `internal: true`로 인터넷·호스트 포트와 끊는다.
+
+| 네트워크 | 연결된 서비스 | 목적 |
+| --- | --- | --- |
+| business-net | internal-api, business-db | 업무 DB에는 내부 API만 접근 |
+| transfer-net | internal-api, transfer-api | 반출 신청 전달, 동의 확인(disclosure-checks) |
+| external-net | external-web, external-api | 회원 화면 → 외부 API |
+| internal-web-net | internal-web, internal-api | 직원 화면 → 내부 API (/api, /auth) |
+| delivery-net | external-api, transfer-api | 전달 목록·다운로드 |
+| transfer-db-net | transfer-api, transfer-db | 중계 DB에는 중계 서버만 접근 |
+| auth-internal-net | keycloak, internal-api, transfer-api | 토큰 교환·검증 |
+| auth-external-net | keycloak, external-api | 회원 토큰 교환·검증 |
+| public-internal / public-external / public-auth | internal-web / external-web / keycloak | 127.0.0.1:8080 / 8090 / 8081 공개 (HTTPS만) |
+
+검사 스크립트로 external-api가 internal-api·business-db·transfer-db와 공유하는 망이 없음을 확인한다. 이 분리는 보조 통제이고, 공격 ①②는 허용된 경로 안에서 일어나므로 실제 차단은 API의 권한·승인 검사가 맡는다.
+
+## 4. 인증과 인가
+
+로그인은 Keycloak이, 권한 판단은 PrivacyGate가 맡는다. 토큰은 브라우저에 주지 않고 API 서버가 보관하는 BFF 방식이다.
+
+**직원 로그인 (Authorization Code + PKCE)**
+
+1. internal-web에서 로그인 → internal-api `/auth/login`이 state·nonce·PKCE verifier를 만들어 서버에 저장하고 Keycloak(client `internal-web`)으로 보낸다.
+2. Keycloak에서 ID·비밀번호를 입력한다.
+3. `/auth/callback`에서 code와 verifier로 토큰을 교환하고 ID 토큰의 서명·iss·aud·exp·nonce를 검증한다.
+4. `sub`(= `user_id`)로 `users` 테이블을 조회해 활성 직원인지 확인하고 서버 세션을 만든다.
+5. 브라우저에는 무작위 세션 ID만 `internal_session` 쿠키(HttpOnly·Secure·SameSite=Strict)로 준다.
+
+직원·회원 모두 OTP 없이 ID·비밀번호로 로그인한다 (5회 실패 잠금·비밀번호 정책은 유지). 직원 로그인 화면(Keycloak 테마 `privacygate-staff`)은 회원 로그인과 같은 2단 구성(왼쪽 안내·오른쪽 로그인 카드)이며 색만 내부 화면의 남색·파랑이다.
+
+**직원 가입 신청 (총관리자 승인)**: internal-web 로그인 화면의 "직원 가입 신청" → internal-api `POST /api/staff-signups`(로그인 전, Origin 일치 + 접속 주소당 10분 5회·전체 30회). 신청 역할은 상담 직원·승인 담당자만(총관리자 불가). internal-api가 `internal-admin`으로 **비활성·업무 역할 없음** Keycloak 계정을 만들고 `staff_signups`에 기록, 총관리자에게 알린다. 총관리자(data_admin)가 "직원 가입 승인" 화면에서 승인하면 계정을 `counselors`·`approvers` 그룹에 넣고 활성화한 뒤 유효 역할이 신청 역할 하나인지 확인하고, DB 함수 `approve_staff_signup`(SECURITY DEFINER, 승인자가 활성 총관리자인지 재확인, 직원 코드 A-C03·A-P02 … 발급)으로 `users`에 등록한다. DB 등록이 실패하면 Keycloak을 다시 비활성·역할 없음으로 되돌린다. 거절하면 Keycloak 계정과 신청 기록을 지운다. 승인 담당자 승인은 기존 승인 담당자에게도 알려, 총관리자가 혼자 반출 승인 권한을 만드는 일이 드러나게 한다.
+
+회원은 external-api가 같은 방식(client `external-web`, 쿠키 `external_session`)으로 처리하고 ID·비밀번호만 쓴다.
+
+**회원가입 (이음 자체 가입 폼)**: Keycloak 자체 가입 화면은 끈 채로(`registrationAllowed=false`) 두고, external-web 가입 폼 → external-api `POST /api/signup` → transfer-api `POST /api/internal/member-signups` → internal-api `POST /api/internal/member-signups` 로 처리한다. 로그인 전 요청이라 세션·CSRF 토큰 대신 external-api가 Origin 일치와 요청 횟수(접속 주소당 10분 5회, 전체 10분 60회)를 확인하고, transfer-api·internal-api는 서비스 토큰만 받는다. internal-api가 입력(프로필 포함 전 항목 필수, 만 19세 이상, 휴대폰·이메일 형식, 개인정보 수집·이용 동의)을 검사한 뒤 `internal-admin`으로 Keycloak 계정을 만들고 `members` 그룹에 넣어 member 역할을 준다(역할 직접 부여 권한 없음, 생성 후 유효 역할이 member 하나인지 재확인). 이어 업무 DB 함수 `register_member`(SECURITY DEFINER)로 `users`·`members`를 저장하면 트리거가 담당 회원이 가장 적은 상담 직원을 배정·알림한다. DB 저장이 실패하면 방금 만든 Keycloak 계정을 지운다. 비밀번호는 Keycloak에만 저장하고 업무 DB·감사 로그·응답에 남기지 않는다.
+
+**인가 원칙**
+
+- internal-api는 역할을 매 요청 `users` 테이블에서 다시 읽는다. 업무 DB가 없는 transfer-api는 Keycloak이 서명한 토큰의 realm 역할로 확인한다(두 값은 같게 관리, 이중 확인). 요청 본문의 user_id는 믿지 않는다.
+- 기본 거부: 경로마다 허용 역할을 선언하고, 선언 없는 `/api` 경로가 있으면 서버가 시작하지 않는다.
+- data_admin에게 승인 권한, approver에게 내보내기·원본 열람 권한을 주지 않는다. 신청자 = 승인자면 거부한다.
+- 직원 승인과 회원 동의를 각각 확인한다. 반출 금지 자료는 승인으로도 허용되지 않는다.
+
+**HTTPS**: 브라우저가 닿는 internal-web·external-web·Keycloak은 TLS(8443)로만 받고, 호스트에는 127.0.0.1의 HTTPS 포트만 연다. 인증서는 `init-env.sh`가 mkcert(없으면 자체 서명)로 만들어 `infra/secrets/tls`에 두며 Git에서 제외한다. 쿠키는 Secure이고 HSTS 헤더를 보낸다. 내부망 구간(nginx→API, API→Keycloak) TLS는 2주차에 적용한다.
+
+**세션**: 유휴 30분·최대 8시간, 로그인마다 새 세션 ID, 로그아웃 시 서버 세션 삭제와 Keycloak 로그아웃. 상태를 바꾸는 요청은 CSRF 토큰과 Origin을 검사한다.
+
+**서버 간 인증**: 서비스 인증정보는 브라우저에 넣지 않는다.
+
+| 호출 | 붙이는 토큰 | 받는 쪽 확인 |
+| --- | --- | --- |
+| internal-api → transfer-api | 직원 access token (aud=transfer-api) | 서명·aud·azp=internal-web, 신청자·승인자 = 토큰 sub |
+| transfer-api → internal-api `/api/internal/disclosure-checks` | transfer-api 서비스 토큰 (aud=internal-api) | azp=transfer-api |
+| external-api → transfer-api `/api/internal/*` | external-api 서비스 토큰 + 회원 access token | 두 토큰 모두 검증, 수신자 = 회원 토큰 sub |
+| transfer-api → internal-api `/api/evidence-files` | transfer-api 서비스 토큰 + 회원 access token (aud=internal-api) | 두 토큰 검증, 제출자 = 회원 토큰 sub, DB에서 활성 회원 확인 |
+| external-api → transfer-api → internal-api `/api/internal/member-signups` (회원가입) | 각 구간의 서비스 토큰만 (회원 토큰 없음) | azp=external-api / azp=transfer-api. internal-api가 입력 검사·계정 생성 |
+
+**회원 알림**: 외부 회원 화면 헤더에 종 아이콘(안 읽은 개수·읽음·삭제·누르면 해당 탭으로 이동)을 둔다. 알림은 직원 알림과 같은 `notifications` 테이블에 회원 user_id로 저장하고, 조회·읽음·삭제는 external-api `/api/me/notifications` → transfer-api `/api/internal/member-notifications` → internal-api `/api/internal/my-notifications`(회원 토큰 sub 기준 본인 것만). 매칭(신청·수락·거절·취소·종료)·만남 일정(제안·합의·다른 일정 요청·확정·반려)·정보 공개 승인·회수는 transfer-api가 업무 처리 뒤 internal-api `POST /api/internal/member-notification-events`(transfer-api 서비스 토큰만)로 **사건 종류와 대상 회원 id만** 보내고 문구는 internal-api가 정한다. 증빙·사진 심사 결과는 internal-api가 심사 처리 중에 직접 만든다. 문구에 상대 이름·연락처·회원 코드는 넣지 않으며, 알림 실패는 업무를 막지 않고 감사 로그(`notify_failed`)에만 남는다.
+
+**회원 증빙 제출 경로**: 회원 → external-web → external-api `POST /api/me/evidence-files` → transfer-api `POST /api/internal/evidence-submissions`(저장하지 않고 전달만) → internal-api `POST /api/evidence-files` → 암호화 후 evidence-storage. external-api는 업무 DB·증빙 저장소에 직접 닿지 않는다. 앞의 두 경로는 명세에 없어 추가했다.
+
+## 5. 연계 공격 경로와 차단 지점
+
+| 단계 | 행위 | 차단 지점 | 비교 API | PrivacyGate |
+| --- | --- | --- | --- | --- |
+| ① 내부 | counselor_a가 자기 세션으로 `POST /api/admin/member-exports` 직접 호출 | internal-api 역할 검사 (data_admin만) | 200, 전체 회원 파일 생성 | 403 ACCESS_DENIED, 파일 미생성 |
+| 연결 | A가 `POST /api/member-exports/{export_id}/transfer-files`로 파일을 반출 대기에 올리고 file_id를 member_b에게 전달 | 검사(scan_status)와 승인(approver, 신청자 제외) 분리 | 승인 없이 대기 | 승인 없으면 전달 대상 아님 |
+| ② 외부 | member_b가 자기 정상 승인 건 다운로드 요청의 file_id를 A가 준 값으로 변경 | transfer-api: delivery_id → 승인 파일(file_id·file_version·file_hash)·수신자·동의·만료 검증 | 수신자만 확인해 비승인 파일 반환 | 403 APPROVAL_MISMATCH, 자료 미반환 |
+
+**비교 시연 방식**: 비교 API를 따로 두지 않고 같은 경로를 `.env`의 `GATE_MODE`로 전환한다. `enforce`(기본)는 모든 통제를 적용하고, `baseline`은 위 표의 ①·② 차단 지점만 끈다. ②는 승인·수신자·동의·만료·승인 파일 무결성 검사를 유지하고 "요청 file_id ↔ 승인 파일" 연결 검사만 생략한다(로그인·세션·CSRF·감사 로그도 유지, 외부·중계 연동 계약 v0.5와 같은 범위). baseline에서 통제를 건너뛴 요청은 감사 로그 reason에 남고 내부 화면 상단에 경고가 뜬다. 시연이 끝나면 enforce로 되돌린다.
+
+전체 회원 내보내기 결과 파일은 서버 내부에만 두고 `export_id`와 건수만 응답한다. 브라우저로 내려받는 경로는 두지 않는다.
+
+서버 간 호출은 서비스 토큰 검증에 성공한 요청에 한해 받은 trace_id를 이어 써서 외부 → 중계 → 내부 로그를 하나로 잇는다. 모든 거부는 trace_id·가명 ID·경로·사유 코드로 JSON 로그에 남고, Wazuh 규칙이 공격 ①②와 같은 계정의 반복 거부(1분 3회)를 경보한다. 차단 여부는 경보가 아니라 API 응답과 파일 상태로 판단한다.
+
+## 6. API 목록
+
+자세한 내용은 `docs/api-spec.md`. 이번 주에는 인증과 `/api/me`를 구현하고, 나머지 경로는 허용 역할만 선언한 뼈대(501)다.
+
+| 서비스 | 경로 | 허용 | 일정 |
+| --- | --- | --- | --- |
+| internal·external | `/auth/login`, `/auth/callback`, `/auth/logout`, `GET /api/me` | 로그인 | 이번 주 |
+| internal-api | `GET /api/members`, `GET /api/members/{member_id}` | counselor | 2주차 |
+| internal-api | `POST /api/admin/member-exports` | data_admin | 3주차 |
+| internal-api | `POST /api/member-exports/{export_id}/transfer-files` (명세 외 추가: 내보내기 결과 중계 등록) | counselor(본인 내보내기만) | 3주차 |
+| internal-api | `POST /api/evidence-files` | transfer-api 서비스 + 회원 | 2주차 |
+| internal-api | `GET /api/evidence-files` (명세 외 추가: 배정된 증빙 목록), `GET /api/evidence-files/{file_id}/content`, `POST …/{file_id}/review` | data_admin | 2주차 |
+| internal-api | `POST /api/internal/disclosure-checks` | transfer-api 서비스 | 3주차 |
+| internal-api | `POST /api/staff-signups` (명세 외 추가: 직원 가입 신청) / `GET /api/staff-signups`, `POST …/{signup_id}/approve`·`reject` | 로그인 전(Origin·횟수 제한) / data_admin | 추가 |
+| internal-api | `GET /api/internal/my-evidence-files`, `GET·POST /api/internal/my-consents`, `POST /api/internal/my-consents/{consent_id}/revoke` (명세 외 추가) | transfer-api 서비스 + 회원 | 2~3주차 |
+| transfer-api | `POST /api/transfer-files`, `POST·GET /api/export-requests`, `GET /api/export-requests/{request_id}` | counselor(본인) / approver | 3주차 |
+| transfer-api | `POST …/{request_id}/approve`, `…/reject`, `POST /api/approvals/{approval_id}/revoke` | approver | 3주차 |
+| transfer-api | `POST /api/internal/delivery-queries`, `GET /api/internal/deliveries/{delivery_id}/download` | external-api 서비스 + 회원 | 3주차 |
+| transfer-api | `POST·GET /api/internal/evidence-submissions`, `GET·POST /api/internal/member-consents`, `POST /api/internal/member-consents/{consent_id}/revoke` (명세 외 추가, 전달만) | external-api 서비스 + 회원 | 2~3주차 |
+| external-api | `GET /api/me/deliveries`, `GET /api/me/deliveries/{delivery_id}/download` | member | 3주차 |
+| external-api | `POST·GET /api/me/evidence-files`, `GET·POST /api/me/consents`, `POST /api/me/consents/{consent_id}/revoke` (명세 외 추가) | member | 2~3주차 |
+| external-api → transfer-api → internal-api | `GET /api/me/notifications`, `POST …/read`·`delete` → `/api/internal/member-notifications` → `/api/internal/my-notifications` (명세 외 추가: 회원 알림) / transfer-api → internal-api `POST /api/internal/member-notification-events` | member / 서비스 토큰 | 추가 |
+| external-api → transfer-api → internal-api | `POST /api/signup` → `POST /api/internal/member-signups` (명세 외 추가: 회원가입) | 로그인 전(Origin·횟수 제한) → 서비스 토큰 | 추가 |
+| internal-api → transfer-api → internal-api | 회원 상세 → `GET /api/matching/members/{user_id}/membership` → `POST /api/internal/member-scope-checks` (명세 외 추가: 회원 이용권 표시) | counselor(담당)·data_admin, 직원 토큰을 X-User-Token 으로 전달 | 추가 |
+
+오류는 `{"error": {"code", "message", "trace_id"}}` 형식이다. 코드: AUTH_REQUIRED(401), ACCESS_DENIED·APPROVAL_MISMATCH·APPROVAL_EXPIRED·CONSENT_INVALID(403), NOT_FOUND(404), INVALID_STATE(409), INVALID_REQUEST(422), INTERNAL_ERROR(500). 판단 근거는 감사 로그에만 남긴다.
+
+## 7. 데이터 저장소와 감사 기록
+
+앱은 테이블 소유자가 아닌 `app_user` 계정으로 접속하고, `audit_log`는 INSERT만 허용한다. 시간은 UTC로 저장하고 화면에서 한국 시간으로 보여 준다.
+
+| 저장소 | 테이블·내용 | 앱 권한 |
+| --- | --- | --- |
+| matchmaking_business | `users`(user_id=Keycloak sub, 가명 ID, 역할, 활성), `members`, `assignments` | 읽기 |
+| matchmaking_business | `introductions`(소개된 회원 쌍: 동의 등록 가능한 상대) | 읽기 |
+| matchmaking_business | `consents`(consent_id, 상대 회원, 항목, purpose, expires_at, revoked_at) | 읽기·추가·수정 (삭제 불가, 철회는 revoked_at) |
+| matchmaking_business | `member_exports`(export_id, 만든 사람, 건수, 저장 키, file_hash, 중계 file_id) — 파일은 evidence-storage/exports/에 암호문 | 읽기·추가·수정 |
+| matchmaking_business | `evidence_files`(file_id, 저장 키, key_id, file_hash, 배정 심사자, 삭제 기한), `evidence_reviews` | 읽기·쓰기 |
+| matchmaking_business | `login_flows`, `sessions`(세션 ID 해시, CSRF, 토큰은 서버만 보관) | 읽기·쓰기·삭제 |
+| matchmaking_transfer | `transfer_files`(file_id, file_version, file_hash, scan_status), `export_requests`(request_id, requester_id, recipient_id, purpose, consent_id, request_status, expires_at) | 읽기·쓰기 |
+| matchmaking_transfer | `approvals`(approval_id, approver_id ≠ 신청자, 승인 파일 고정), `deliveries`(delivery_id, recipient_id) | 읽기·쓰기 |
+| 두 DB | `audit_log` (trace_id 기준) | 추가만 |
+| evidence-storage | 증빙 암호문 | internal-api만 마운트 |
+| transfer-staging / transfer-verified | 검사 전 / 검사 통과 파일 | transfer-api만 마운트 |
+
+감사 로그는 DB와 JSON 파일(`audit-logs` 볼륨)에 함께 쓴다. 필드는 ts·service·trace_id·actor(가명)·role·action(경로 템플릿)·target_type·target_id·result·reason이며, 자료 본문·연락처·비밀번호·세션·토큰 값은 남기지 않는다(그 외 필드는 기록 단계에서 버린다). 증빙 암호화 키는 Docker secret 파일로 주입한다.
+
+**증빙 기한 삭제**: internal-api 안에서 주기적으로 실행되는 작업이 삭제 기한이 지난 증빙 원본을 evidence-storage에서 지우고 상태를 `deleted`로 바꾼다(법적 보존 `legal_hold`는 제외). 실패하면 감사 로그에 `evidence_delete` error를 남기고 Wazuh가 경보한다. 별도 API는 없다.
+
+## 8. 실행 환경과 저장소 구성
+
+GitHub 조직 `privacygate-matchmaking`에 세 레포를 두고, 같은 상위 폴더에 나란히 clone한다.
+
+| 레포 | 내용 | 담당 |
+| --- | --- | --- |
+| `matchmaking-internal` | internal-web, internal-api, tests, docs | 이세빈 |
+| `matchmaking-external` | external-web, external-api, transfer-api, tests, docs | 한은결 (transfer-api 공동) |
+| `privacygate` | 공통 보안 Python 패키지(`src/privacygate`), **실행 환경**: compose.yaml, .env.example, infra(DB 스키마·Keycloak·Wazuh·스크립트) | 이세빈 |
+
+`privacygate` 폴더에서 `./infra/scripts/init-env.sh` 후 `docker compose up -d --build`로 전체를 띄운다. `.env`와 `infra/secrets/`는 Git에서 제외한다.
+
+| 주소 | 서비스 | 용도 |
+| --- | --- | --- |
+| https://localhost:8080 | internal-web | 직원 화면 |
+| https://localhost:8081 | keycloak | 로그인 화면, 관리 콘솔 `/admin` (infra_admin) |
+| https://localhost:8090 | external-web | 회원 화면 |
+
+시험 계정: `counselor_a`(내부 공격자 A), `counselor_b`, `data_admin`(총관리자), `approver`, `member_b`(외부 공범 B).
+
+**이번 주(11/02~11/08)**
+
+- [x] 명칭 규칙 반영: 레포·서비스·DB·저장소·네트워크·역할·필드·API·오류 코드
+- [x] 실행 환경·DB 스키마·infra 를 `privacygate` 레포로 모음 (패키지는 `src/` 에 그대로, 이미지에는 패키지 파일만 복사)
+- [x] compose 실행 환경, Keycloak realm `matchmaking`(PKCE S256, 5회 실패 잠금, 서비스 계정)
+- [x] 업무·중계 DB 스키마, 앱 계정 분리, 감사 테이블 추가 전용
+- [x] internal-api: 로그인·서버 세션·CSRF·역할 재확인·감사 로그·공통 오류, 모든 경로 권한 선언
+- [x] transfer-api·external-api 뼈대 (경로·허용 호출자 선언)
+- [x] 브라우저 구간 HTTPS (internal-web·external-web·Keycloak), 회원 증빙 제출 경로
+- [x] privacygate 공통 패키지 단위 시험 통과 (PKCE, 기본 거부, 직무 분리, 세션, CSRF, 감사 로그, 공격 ② 검증)
+- [ ] 각자 PC에서 `docker compose up` 후 로그인까지 확인
+
+**열린 질문**
+
+- [ ] 서비스 간 TLS 적용 시점 (2주차 제안), Wazuh 실행 PC (메모리 4GB 이상)
+
+**시연 배포 (Tailscale Funnel, 무료)**: 컴퓨터 1(Mac)에서 Compose 전체를 실행하고, 인터넷에는 Funnel 로 회원 화면(443)과 회원 로그인 경로(8443 → `auth-gateway` → Keycloak `/realms/matchmaking`·`/resources` 만)만 공개한다. 직원 화면(:8080)·Keycloak 관리(:8081, `KC_HOSTNAME_ADMIN`)·Wazuh(:8444)는 `tailscale serve` 로 tailnet(팀원 기기) 전용이다. 외부 PC(Windows, Tailscale 미연결)는 인터넷을 거쳐 공개 주소로만 접속하고, `check-exposure.ps1` 로 공개·차단 결과를 증거로 남긴다. 서버가 물리적으로 한 대인 한계는 있으나 공개 범위(Funnel)·접근 주체(tailnet)·서비스 간 망(Docker internal 네트워크) 세 경계를 겹쳐 적용한다. 절차는 `privacygate/infra/funnel/README.md`.
+
+## 9. 명세 대비 추가·변경 기록
+
+명세서에 없던 항목은 팀 합의 후 추가하고 여기에 남긴다.
+
+| 항목 | 이유 |
+| --- | --- |
+| 보조 네트워크 5개 + 공개 포트용 3개 (명세의 3개 망 외) | 서비스 쌍마다 망을 나눠 external-api가 내부 자료와 망을 공유하지 않게 함 |
+| Keycloak 클라이언트 `transfer-api`, `external-api`, `internal-api` | 서버 간 호출을 서비스 토큰으로 검증 |
+| 오류 코드 `NOT_FOUND`, `INVALID_REQUEST`, `INTERNAL_ERROR` | 명세의 404·422·500 상태에 대응하는 코드 |
+| internal-api의 반출 경로(`/api/export-requests` 등) 전달 | 직원 화면이 서비스 인증정보 없이 중계를 호출하도록 internal-api가 직원 토큰을 붙여 전달 |
+| 실행 환경·DB 스키마·infra를 `privacygate` 레포에 둠 | 기존 레포 운영 방식 유지 (패키지는 `src/`, 이미지에는 패키지 파일만 복사) |
+| 회원 증빙 제출 경로 `POST /api/me/evidence-files`(external-api), `POST /api/internal/evidence-submissions`(transfer-api) | 증빙은 회원이 제출하며 external-api는 증빙 저장소에 닿을 수 없으므로 중계를 거침 |
+| 직원 로그인 테마(한국어), internal-web 클라이언트에만 적용 | 직원 화면과 같은 디자인, 회원 화면은 팀원 담당 |
+| `GET /api/evidence-files` (data_admin, 배정된 증빙 목록) | 심사자가 열람할 file_id를 알기 위해 필요. 원본 내용은 포함하지 않음 |
+| 비교 시연 모드 `GATE_MODE=enforce/baseline` (API 추가 없음) | 제안서의 "비교 API vs PrivacyGate"를 같은 경로에서 전환해 비교. 기본 enforce |
+| 관리자 내보내기 결과는 서버 내부 보관, `export_id`·건수만 응답 | 전체 회원 파일이 브라우저로 나가지 않게 함 (내려받기 API 추가 안 함) |
+| 회원 증빙 심사 상태 조회 `GET /api/me/evidence-files` → `GET /api/internal/evidence-submissions` → `GET /api/internal/my-evidence-files` | 회원이 제출 결과를 확인 (상태만, 원본·심사자 정보 없음) |
+| 회원 동의 등록·철회 `/api/me/consents` → `/api/internal/member-consents` → `/api/internal/my-consents` | 동의를 시험 데이터가 아닌 회원 조작으로 관리, 동의 철회 시나리오 시연 |
+| `POST /api/member-exports/{export_id}/transfer-files` (counselor, 본인 내보내기만) | 외부·중계 계약 v0.5의 "내부 백엔드가 파일 바이트를 multipart로 중계에 등록"을 내부에서 구현. 공격 연결 단계 재현 |
+| `introductions` 테이블(소개 관계)과 `member_exports` 테이블 | 외부 동의 화면의 소개 상대(counterparts) 제공, 내보내기 결과 관리 |
+| baseline 범위를 "요청 file_id ↔ 승인 파일 연결 검사만 생략"으로 축소 | 외부·중계 계약 v0.5와 통일 (승인·동의·만료·무결성 검사는 유지) |
+| 서비스 토큰으로 인증된 요청의 `X-Trace-Id` 이어 쓰기 | 외부 → 중계 → 내부 감사 로그를 하나의 trace_id로 연결 |
+| `.gitattributes`로 소스·스크립트 줄바꿈 LF 고정 | Windows 작업 환경에서 `.sh`가 CRLF로 바뀌어 DB 초기화가 깨지는 문제 방지 (외부 레포와 같은 규칙) |
+| 회사 이름 "이음" (realm 표시 이름 "이음 (가상 결혼정보회사)") | 외부 화면과 통일 |
+| 직원 access token 서버 갱신 (refresh token, 세션 DB 보관) | 반출 화면이 중계를 부를 때 만료된 토큰 때문에 끊기지 않게 함. 토큰은 브라우저에 주지 않음 |
+| 증빙 원본 기한 삭제 주기 작업 (5분마다, `legal_hold` 제외) | 심사 후 7일·미심사 30일 보관 원칙을 자동 집행. 실패는 감사 로그 `evidence_delete` error |
+| `GET /api/admin/member-exports` (data_admin) | 상담 직원의 내보내기 같은 이상 행위 확인 |
+| 상담 직원 `counselor_b` 추가, 새 회원 담당자 무작위 자동 배정 (DB 트리거) | 담당 관계를 직원별로 나눠 "담당 회원만 조회" 통제를 보여줌. A-001~A-003 은 시연용으로 counselor_a 고정 |
+| 중계가 직원 토큰을 거절한 401 은 내부 오류(500)로 바꿔 전달 | 브라우저 세션 만료로 오인해 로그인 화면으로 돌아가는 문제 방지 |
+| 회원 간 매칭으로 동의 생성 (`matches` 테이블, `/api/internal/my-matches`) | 회원이 동의서를 따로 쓰지 않고 서로 매칭을 누르는 것으로 정보 제공에 동의. 직원 발송 신청·승인 흐름은 그대로 (화면 이름만 "소개 자료 발송") |
+| 회원 관리(정보 수정·탈퇴)·증빙 심사를 counselor(담당 회원)와 data_admin(전체)에게 허용 | 담당 직원이 자기 회원을 끝까지 관리. 담당 범위는 서버가 SQL 조건으로 확인(범위 밖 404) |
+| 탈퇴: 2단계 확인 → 7일 유예(탈퇴 예정, 철회 가능) 또는 즉시 탈퇴 → 회원 정보 DB 삭제 | 개인정보 파기. 삭제 범위는 SECURITY DEFINER 함수 `purge_member` 로 고정(앱 계정에 테이블 DELETE 권한 없음), 유예 만료분은 주기 작업이 삭제, 감사 로그(회원 코드)만 남김 |
+| 총관리자 = `data_admin` 계정 (화면 표시 "총관리자") | 전체 회원·증빙 관리 담당. 새 역할·계정을 만들지 않아 명세서·중계 역할 확인과 호환 |
+| 메뉴 4개: 담당 회원 조회 / 회원 관리 / 회원·서류 조회·심사·승인 / 소개 자료 발송 승인 | 역할별 화면 정리 (앞의 3개는 counselor·data_admin, 마지막은 approver) |
+| 소개 자료를 직원이 업로드하지 않고 서버가 회원 DB 로 생성 (`POST /api/members/{id}/introductions`) | 직원이 임의 파일을 회원 자료로 보내는 경로 제거. 자료에는 가명 ID·연령대·직업·증빙 확인 여부만 (이름·연락처·증빙 원본 제외). 승인은 그대로 다른 승인자 |
+| 화면용 짧은 이름: 소개 자료 `A-001_file1`, 동의 `C-n`, 직원·회원 가명 ID (`intro_files` 테이블, `consents.consent_no`) | 중계·DB 의 실제 키(UUID)는 그대로 두고 화면에만 짧은 이름 사용. 승인 회수도 이름으로 (`POST /api/approvals/revoke-by-label`) |
+| 회원 프로필 확장: 생년월일(만 나이)·키·몸무게(본인 신고)·학력 구분/학교/전공·직군·직장·소개 | 매칭 전에는 회원 코드·나이·키·몸무게·학력 구분·직군·소개만, 매칭·제공 후에 실명·학교·(재직 확인 시)직장 |
+| 증빙 종류 학력/재직(`evidence_files.kind`), 학력 증빙 통과해야 매칭 가능 | 키·몸무게는 증명 서류가 사실상 건강정보(민감정보)라 최소 수집 원칙에 따라 본인 신고. 학력·직장만 서류로 확인 |
+| 학력·직장 정보를 수정하면 해당 증빙 확인 해제 | 증빙 통과 후 정보를 바꿔 허위 정보에 '확인' 표시가 붙는 것 방지 |
+| 코드 규칙: 직원 `<A~Z>-<역할 C/D/P><2자리>`(예: A-C01), 회원 `<A~Z>-<3자리>`(A-001…A-999→B-001, DB 자동 발급) | 코드는 관리자 화면·감사 로그 전용. 회원 화면·회원에게 가는 응답과 소개 자료에는 넣지 않음 (상대는 "소개 상대 · 만 나이 · 학력"으로 표시) |
+| 매칭 전 공개 정보를 만 나이·키·몸무게·학력 구분·소개로 한정, 소개 자료(매칭·승인 후)에는 실명 포함 | 단계별 최소 공개. 학교·직장은 매칭 후, 직장은 재직 증빙 통과 시만 |
+| 시험 데이터 전면 교체 (회원 10명, 새 코드 규칙) | 프로필·증빙 규칙 변경에 맞춰 시드 재작성. 초기화는 `down -v` 후 재기동 |
+| 회원 성별(`gender`) 추가, 직원 화면에 이름·성별 표시 | 담당 직원·총관리자가 회원을 식별·관리하기 위해 필요 (연락처는 계속 비표시) |
+| 직원 OTP(TOTP) 제거, ID·비밀번호 로그인 | 팀 결정. 계정 보호는 비밀번호 정책·5회 실패 잠금·세션 통제로 유지 (명세서의 직원 TOTP 항목 변경) |
+| 탈퇴 권한 차등: 즉시 탈퇴는 총관리자만, 총관리자가 요청한 탈퇴는 상담 직원이 철회 불가, 탈퇴 사유(선택)·요청자 기록 | 되돌릴 수 없는 삭제를 상위 권한으로 제한하고, 상위 결정이 하위 직원에게 뒤집히지 않게 함 (서버에서 확인) |
+| 직원 알림 (`notifications` 테이블, 헤더 종 아이콘·읽지 않은 개수 배지, 읽음·삭제·선택 처리) | 증빙 제출·매칭 성사·발송 신청/승인/거절/회수·탈퇴 요청/철회/확정·신규 배정·전체 내보내기(상담 직원 실행 시 경고)를 담당자에게 알림. 문구에는 회원 코드·이름까지만 |
+| 회원 본인 탈퇴 신청·철회 (`/api/internal/my-withdrawal`), 계정 상태 조회 (`/api/internal/my-status`) | 회원이 직접 탈퇴할 수 있게 하고, 직원이 탈퇴 처리한 회원이 로그인했을 때 이유 없이 막히지 않도록 "관리자에 의해 탈퇴 처리됨 + 사유" 안내 (본인 탈퇴는 "탈퇴된 계정입니다") |
+| 탈퇴 안내 기록 `withdrawal_notices` (Keycloak 계정 id·직원 처리 여부·사유·삭제 예정일만, 이름·회원 코드 없음) | 회원 정보 삭제 후에도 안내를 보여 주기 위한 최소 기록. 안내 기간(기본 30일) 후 삭제 |
+| 탈퇴 회원 Keycloak 계정 정리: 확정 즉시 세션 종료, 안내 기간 후 계정 삭제 (client `internal-admin`, `INTERNAL_ADMIN_CLIENT_SECRET`) | 로그인 계정까지 파기. 관리 권한은 전용 client 로 분리하고 삭제 전 member 역할만 있는지 확인. 결과는 감사 로그 `member_account_delete` |
+| 권한 동작 자동 시험 `tests/test_permissions.py` | 경로 선언 검사에 더해, 실제 요청으로 담당 범위 404·역할 403·알림 본인 한정·탈퇴 철회 권한을 확인 (보고서 근거) |
+| 증빙 확장: 신분증·혼인관계증명서·소득·부동산(PDF), 프로필 사진(JPEG·PNG) | 결혼정보회사 실제 검증 범위(본인·혼인·소득·자산)를 다루되, 다른 회원에게는 원본 대신 요약(구간·여부)과 마스킹 사본만 |
+| 증빙 자동 검사 서비스 doc-inspector (Tesseract kor 로컬 OCR, 규칙 기반 개인정보 탐지·마스킹, 사진 메타데이터 제거) | 외부 AI 로 문서를 보내지 않음. 문서 파서는 공격 표면이 커서 별도 컨테이너(inspect-net, 읽기 전용, 비밀값·저장소·DB 없음)로 격리 |
+| 진위 판단: 발급번호 형식·검증숫자(Luhn) + 합성 발급대장 `doc_registry` 대조(종류·성명·생년월일·폐기 여부) | 실제 기관 연동 대신 시험 가능한 진위 확인. 결과는 verified/suspicious/unchecked, 최종 판단은 직원 |
+| `evidence_inspections`(검사 결과, 추출 값은 암호문) · `evidence_results`(통과 결과: 요약·마스킹 사본) | 원본 보존 기간이 끝나면 검사 결과도 삭제하고, 공개 가능한 결과만 회원 정보 삭제 때까지 유지 |
+| 공개 범위 확장: income·marital_status·property(텍스트), photo·documents·contact(승인 자료 전용) | 화면 열람은 동의만으로, 이미지·연락처는 담당 직원 요청 + 승인자 승인(반출 통제) 경로로만 |
+| 연락처 최종 전달: 상호 연락처 동의 + 만남 일정 확정 + 신분증 통과 + 직원 요청 + 승인자 승인 | 일정 확정만으로 연락처가 공개되지 않게 하고, 철회 시 재다운로드 차단 |
+| 합성 증빙 생성 스크립트 `infra/scripts/make-sample-evidence.sh` | 실제 개인정보 없이 6종 서류·사진을 만들어 검사·심사·반출 흐름을 시험 |
+| 외부 "내 계정": 비밀번호 변경(Keycloak AIA), 프로필 사진 등록·변경, 키·몸무게(본인 신고)·연락처 변경, 회원 탈퇴 | 계정 정보 관리를 한곳에 모으고 증빙 관리(서류)와 분리. 연락처는 등록·변경만 하고 제공은 매칭 동의·승인 절차에서만 |
+| 만남 일정: 회원끼리 제안·합의(최대 3개 후보) → 담당 직원은 승인·반려만, 직원 일정 제안 경로 삭제 | 직원이 회원 일정을 대신 잡는 것은 업무상 어색하고, 승인 단계로 확정 책임은 유지 |
+| 중계가 넘긴 직원 토큰은 `aud=transfer-api` 로 검증 (`staff_relay_verifier`) | internal-web 토큰의 대상은 transfer-api 뿐이라 기존 검증(`aud=internal-api`)이 담당 확인 API를 항상 거절하던 문제 수정 |
+| 직원 "매칭·동의·일정" 화면을 목록 + 상세 구조로 변경, 목록에 일정 상태(승인 대기 등) 표시 | 신청이 많아도 한눈에 보고, 필요한 건만 열어 처리 |
+| 공개 항목 조정: 이름 범위 추가(소개 상대 → 실명). 모든 항목은 직원 요청 + 승인자 승인 후에만 상대 화면에 표시(연락처는 일정 확정 + 상호 동의 추가) | 회원 동의만으로 정보가 노출되지 않게 승인 단계를 모든 항목에 적용하고, 승인된 결과는 회원이 쓰는 화면에서 바로 확인 |
+| 승인 담당자 목록·상세에 "자료 주인 → 받는 회원"과 제공 항목 표시 | 어떤 회원의 무엇을 내보내는지 알고 승인하도록 |
+| 최종 비교 시연 도구(`privacygate/infra/scripts/compare/`): 모드 전환, 브라우저 동일 요청 코드, 증거 수집, 비교 보고서 + Wazuh 규칙 100132(baseline 역할 검사 우회 허용 기록) | 응답·실제 파일·감사 로그·Wazuh 경보를 한 폴더에 남겨 baseline 과 enforce 를 같은 기준으로 비교 |
+| 회원가입: 이음 자체 가입 폼(외부) → external-api `/api/signup` → transfer-api → internal-api `/api/internal/member-signups`. Keycloak 계정은 `internal-admin` 이 만들고 `members` 그룹으로 member 역할 부여, 업무 DB 는 `register_member` 함수로만 저장 | Keycloak 자체 가입을 열지 않고 가입 정보 검사·저장·담당 배정을 내부가 최종 판단. 앱 계정에 users·members INSERT 권한을 주지 않고, 로그인 전 요청은 Origin·횟수 제한으로 보호 |
+| 담당자 자동 배정: 무작위 → 담당 회원(탈퇴 대기 제외)이 가장 적은 상담 직원(같으면 무작위) | 신규 회원을 상담 직원 사이에 고르게 나눔 |
+| 개인정보 수집·이용 동의 기록 `members.privacy_consent_version`·`privacy_consented_at` | 가입 시 어떤 동의 문구에 동의했는지 남김 (동의 없이는 가입 불가) |
+| 직원 가입 신청 → 총관리자 승인 (`staff_signups`, `approve_staff_signup`, Keycloak 그룹 `counselors`·`approvers`). 신청 역할은 상담·승인만, 승인 전 계정은 비활성·역할 없음, 거절 시 계정 삭제 | 신규 직원 계정을 운영자가 직접 만들지 않고도 통제된 절차로 발급. 승인 담당자 승인은 기존 승인 담당자에게 알려 직무 분리 약화를 드러냄 |
+| 직원 로그인 화면을 회원 로그인과 같은 2단 구성으로 변경 (테마 CSS·그림만) | 두 로그인 화면의 구조를 맞추고 색으로 내부/외부를 구분 |
+| 외부 헤더·"내 계정"에 로그인한 회원 이름 표시 (내부 `my-profile` 에 본인 `name`·`username` 추가) | 어떤 계정으로 로그인했는지 바로 확인. 본인 정보만 반환 |
+| 외부 회원 알림 (헤더 종 아이콘, `notifications` 테이블 공유, 중계는 사건 종류만 전달) | 매칭·일정·공개 승인·심사 결과를 회원이 놓치지 않게 함. 문구를 내부가 정해 중계가 임의 내용을 회원에게 보낼 수 없고, 상대 개인정보는 알림에 담지 않음 |
+| 시연 배포: Tailscale Funnel(`compose.funnel.yaml`, `auth-gateway`, `infra/scripts/funnel.sh`), 로그인 후 주소를 `.env` 주소로 맞추는 `realm-setup.sh`, 외부 PC 노출 점검 `check-exposure.ps1`, nginx `real_ip`(Tailscale 이 전달한 접속 주소로 요청 횟수 제한) | 비용 없이 실제 인터넷 경유로 외부 공격자 시나리오를 시연하고, Keycloak 관리·직원 화면·Wazuh 는 인터넷에 노출하지 않음 |
+| 회원 상세에 승인된 증빙 요약(소득 구간 등)과 유료/무료·남은 이용권·구매일 표시. 이용권은 중계가 내부 `member-scope-checks` 로 담당 범위를 확인한 뒤 요약만 반환 | 상담 직원이 소개 전 회원 상태를 한 화면에서 확인. 주문 번호·결제 정보는 넘기지 않고, 담당이 아닌 회원의 이용권은 중계에서도 거절 |
+| 목록 페이지 나누기: 외부 증빙 5·증빙 내역 7·매칭 7개, 내부 모든 목록 10개. 검색은 전체 목록 기준 | 목록이 길어져도 화면이 늘어지지 않고, 다른 페이지의 항목도 검색으로 찾음 |
+| 소개 후보 범위: 직원 소개 관계 + 성별이 다른 활동 회원(담당 직원 무관). 후보 화면은 진행 중·성사 상대를 빼고, 종료·거절·취소된 상대는 "매칭 취소"로 맨 뒤에 표시(전체·새 매칭·매칭 취소 분류) | 새 회원도 바로 후보를 보고, 다른 직원 담당 회원과도 매칭. 범위 판단은 계속 내부가 하고 중계·외부는 받은 목록만 씀 |
+| 담당 상담 직원의 관계 종료(`/api/matching/requests/{match_id}/end`): 한쪽 회원만 담당해도 가능, 공개 동의·일정 함께 종료, 두 회원에게 알림 | 문제 있는 매칭을 직원이 정리. 종료 후 상대는 후보에 다시 표시 |
+| 매칭 필수 조건에 프로필 사진 승인 추가(신분증·학력·사진), 후보 화면에 본인 조건 체크리스트·신청 규칙 표시 | 사진 없는 회원끼리의 소개를 막고, 회원이 무엇이 부족한지 바로 알게 함 |
+| 프로필 사진 상호 공개: 두 회원이 모두 사진 제공에 동의해야 서로의 사진이 전달됨(요청·승인·다운로드마다 확인) | 한쪽만 얼굴을 드러내는 비대칭 노출을 막음. 한쪽이 철회하면 상대 사진도 더 이상 받지 못함 |
+| 회원 소개글: 내 계정에서 직접 수정(10~300자), 소개 후보 카드에 표시. 전화번호·이메일·링크·메신저 아이디가 있으면 저장 거절, 예전 자료에 섞여 있으면 카드에 표시하지 않음 | 회원이 자신을 소개하되, 소개글로 연락처를 넘겨 매칭·공개 승인 절차를 우회하지 못하게 함 |
+| 상호주의 공개: 이름·프로필 사진·소득·부동산·혼인관계·연락처는 같은 항목을 서로 공개해야만 전달(학력·재직·소개는 한쪽 공개 가능) | 가짜·악성 회원이 자기 정보는 숨기고 여러 상대의 민감 정보를 모으는 수집 공격을 막음. 요청·승인·다운로드마다 확인해 한쪽 철회 시 양쪽 모두 중단 |
+| 혼인관계증명서를 매칭 필수 증빙으로 추가(신분증·학력·프로필 사진·혼인관계). 직원이 확정한 상태(미혼·이혼·사별)를 후보 카드에 표시하고, 공개 범위 선택 목록에서는 뺌 | 혼인 상태는 결혼정보 서비스의 기본 조건이라 매칭 전에 확인. 원본·문서 사본이 아니라 직원이 확정한 상태값만 보임 |

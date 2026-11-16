@@ -1,0 +1,34 @@
+name: External service tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v4
+        with:
+          repository: privacygate-matchmaking/privacygate
+          ref: fcdb992d74e206faf9a8e0c240e3fe1a9756ae61
+          path: .deps/privacygate
+      - run: python -m pip install '.[test]' './.deps/privacygate[web]'
+      - run: python -m pytest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/frontend/account.test.cjs tests/frontend/meetings.test.cjs tests/frontend/material.test.cjs
+  observability-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest -r requirements-wazuh.txt
+      - run: python -m pytest tests/observability

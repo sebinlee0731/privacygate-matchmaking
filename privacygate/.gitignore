@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.DS_Store
+
+# 비밀값 — 절대 커밋하지 않음
+.env
+infra/secrets/*
+!infra/secrets/.gitkeep
+*.key
+*.pem
+*.log
+
+# 합성 시험 증빙 (make-sample-evidence.sh 출력)
+samples/
+
+# 최종 비교 시연 증거 (compare/collect-evidence.sh 출력, 합성 데이터지만 외부 공유 금지)
+evidence/

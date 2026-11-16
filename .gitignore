@@ -1,0 +1,20 @@
+# 비밀값·실행 데이터는 올리지 않는다
+.env
+**/.env
+**/infra/secrets/*
+!**/infra/secrets/.gitkeep
+**/.local/
+evidence/
+**/evidence/
+samples/
+**/samples/
+*.pem
+*.key
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+.DS_Store
+*.tgz
+*.zip
+*.docx

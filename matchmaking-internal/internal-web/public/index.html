@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>이음 — 내부 업무 콘솔</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="test-strip">이음 내부 업무 시스템 · 인가된 직원 전용 · 모든 회원과 자료는 가상입니다.</div>
+  <header class="header">
+    <a href="/" class="brand"><span class="brand-icon">이</span>이음<span class="brand-en">IEUM</span></a>
+    <span class="header-label">STAFF CONSOLE</span>
+    <div id="account" class="account" hidden>
+      <div class="notif">
+        <button type="button" id="bell" class="bell" aria-label="알림" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-1.7 1.7A1 1 0 0 0 4 19.4h16a1 1 0 0 0 .7-1.7Z"/></svg>
+          <span class="badge" id="bell-badge" hidden>0</span>
+        </button>
+        <div class="notif-panel" id="notif-panel" role="dialog" aria-label="알림" hidden>
+          <div class="notif-head">
+            <strong>알림</strong><span class="muted" id="notif-summary"></span>
+            <span class="spacer"></span>
+            <button type="button" class="text-button" id="notif-read-all">모두 읽음</button>
+            <button type="button" class="text-button danger-text" id="notif-delete-all">모두 삭제</button>
+          </div>
+          <div class="notif-tools">
+            <label class="check"><input type="checkbox" id="notif-select-all"> 전체 선택</label>
+            <span class="spacer"></span>
+            <button type="button" class="btn sm" id="notif-read-sel" disabled>선택 읽음</button>
+            <button type="button" class="btn sm danger" id="notif-delete-sel" disabled>선택 삭제</button>
+          </div>
+          <ul class="notif-list" id="notif-list"></ul>
+          <div class="notif-empty" id="notif-empty" hidden>새 알림이 없습니다.</div>
+        </div>
+      </div>
+      <span class="avatar" id="avatar"></span>
+      <span id="user-label"></span>
+      <button id="logout-btn" type="button" class="text-button">로그아웃</button>
+    </div>
+  </header>
+
+  <main>
+
+    <section id="login-view" class="login-layout" hidden>
+      <div class="welcome">
+        <span class="eyebrow">AUTHORIZED STAFF ONLY</span>
+        <h1>회원의 정보는,<br>필요한 만큼만 안전하게.</h1>
+        <p>담당 회원 조회, 증빙 심사, 소개 자료 반출 승인을<br>권한에 맞게 처리하는 이음 내부 업무 콘솔입니다.</p>
+        <div class="art" aria-hidden="true"><div class="arch arch-one"></div><div class="arch arch-two"></div><span class="art-line"></span><span class="art-caption">권한 · 승인 · 기록</span></div>
+      </div>
+      <div class="login-card">
+        <span class="eyebrow">STAFF SIGN-IN</span>
+        <h2>직원 로그인</h2>
+        <p class="muted">직원 아이디와 비밀번호로 로그인합니다.</p>
+        <a class="primary wide" href="/auth/login">직원 로그인 <span aria-hidden="true">↗</span></a>
+        <p id="login-msg" class="error" role="alert" hidden></p>
+        <div class="login-help">회원 계정으로는 로그인할 수 없습니다.<br>업무가 끝나면 반드시 로그아웃하세요. 모든 접근은 기록됩니다.</div>
+        <div class="signup-entry"><span class="muted">새로 입사한 직원인가요?</span><button id="staff-signup-open" class="btn wide" type="button">직원 가입 신청</button></div>
+      </div>
+    </section>
+    <section id="staff-signup-view" class="signup-layout" hidden></section>
+
+
+    <div id="app-view" hidden>
+      <div id="baseline-banner" class="notice danger" hidden>
+        비교 시연 모드(GATE_MODE=baseline)입니다. 공격 ①② 대상 통제가 꺼져 있습니다. 시연 후 enforce 로 되돌리세요.
+      </div>
+      <div class="overview">
+        <div><span class="small-label">접속 직원</span><strong id="side-user"></strong></div>
+        <div><span class="small-label">업무 역할</span><strong id="side-role"></strong></div>
+        <p><span id="crumb" class="crumb">이음 내부 업무</span><br><span class="muted">메뉴는 역할에 맞게 보이며, 권한은 서버가 요청마다 다시 확인합니다.</span></p>
+      </div>
+
+      <nav class="tabs" id="nav" aria-label="업무 메뉴">
+        <button type="button" class="tab" data-view="members"   data-roles="counselor,data_admin">담당 회원 조회</button>
+        <button type="button" class="tab" data-view="manage"    data-roles="counselor,data_admin">회원 관리</button>
+        <button type="button" class="tab" data-view="evidence"  data-roles="counselor,data_admin">회원·서류 조회·심사·승인</button>
+        <button type="button" class="tab" data-view="approvals" data-roles="approver">소개 자료 발송 승인</button>
+        <button type="button" class="tab" data-view="meetings" data-roles="counselor">매칭·동의·일정</button>
+        <button type="button" class="tab" data-view="staff_signups" data-roles="data_admin">직원 가입 승인</button>
+      </nav>
+
+      <section class="view" data-view="staff_signups" data-title="직원 가입 승인" hidden>
+        <div class="page-heading"><div><span class="eyebrow">STAFF SIGN-UP REQUESTS</span><h1>직원 가입 승인</h1><p class="muted">직원 가입 신청을 확인하고 승인하거나 거절합니다. 승인하면 Keycloak 계정이 활성화되고 신청 역할(상담 직원·승인 담당자)과 직원 코드가 부여됩니다. 거절하면 계정과 신청 기록이 삭제됩니다. 승인 담당자 승인은 기존 승인 담당자에게도 알려집니다.</p></div></div>
+        <p id="staff-signup-result" class="result" hidden></p>
+        <div id="staff-signup-panel"></div>
+      </section>
+
+      <section class="view" data-view="meetings" data-title="매칭·동의·일정" hidden>
+        <div class="page-heading"><div><span class="eyebrow">MATCHING · CONSENT · MEETING</span><h1>매칭·동의·일정</h1><p class="muted">담당 회원의 매칭 목록입니다. '상세'를 누르면 공개 동의·자료 발송과 만남 일정을 봅니다. 일정은 두 회원이 직접 합의하고, 담당 직원은 합의된 일정을 승인만 합니다. 연락처는 자동 전달하지 않습니다.</p></div></div>
+        <div id="matching-overview-panel"></div>
+      </section>
+
+      <section class="view" data-view="members" data-title="담당 회원 조회" hidden>
+        <div class="page-heading"><div><span class="eyebrow">ASSIGNED MEMBERS</span><h1>담당 회원 조회</h1><p class="muted" data-roles="counselor">나에게 배정된 회원만 보입니다. 유효한 제공 동의가 있는 회원 사이에서 소개 자료 발송을 요청할 수 있습니다.</p><p class="muted" data-roles="data_admin">총관리자는 전체 회원과 담당 배정을 봅니다.</p></div></div>
+        <div class="content-layout"><div class="work">
+          <div class="section-title"><h2>회원 목록</h2><span class="muted" id="members-count"></span></div>
+          <div class="searchbar"><input type="search" id="members-search" placeholder="회원 코드·이름·학력·직군·담당 직원으로 검색" aria-label="회원 검색"></div>
+          <div class="tablewrap">
+            <table>
+              <thead id="members-head"><tr><th data-sort="pseudo_id">회원</th><th data-sort="name">이름</th><th data-sort="gender">성별</th><th data-sort="age">나이</th><th data-sort="height_cm">키</th><th data-sort="education_level">학력</th><th data-sort="job_group">직군</th><th data-sort="counselors">담당 직원</th><th data-sort="status">상태</th><th>관리</th></tr></thead>
+              <tbody id="members-body"></tbody>
+            </table>
+            <div class="empty" id="members-empty" hidden>회원이 없습니다.</div>
+          </div>
+          <div class="card mt16" id="member-detail" hidden>
+            <div class="row-between"><h2 id="member-detail-title"></h2><span id="member-detail-status"></span></div>
+            <dl class="facts" id="member-facts"></dl>
+            <h3 class="sub-h">유료 매칭·일정</h3><div id="member-matching-panel"></div>
+            <p class="muted">회원의 유료 신청과 상대 수락으로 성사됩니다. 공개 동의는 별도이며 자동 생성하지 않습니다. 일정은 두 회원이 직접 합의하고, 담당 상담 직원은 매칭·동의·일정 탭에서 승인합니다.</p>
+            <h3 class="sub-h">제공 동의</h3>
+            <div class="tablewrap">
+              <table>
+                <thead><tr><th>받는 회원</th><th>항목</th><th>목적</th><th>만료</th><th>상태</th><th data-roles="counselor">관리</th></tr></thead>
+                <tbody id="consents-body"></tbody>
+              </table>
+              <div class="empty" id="consents-empty" hidden>동의가 없습니다.</div>
+            </div>
+          </div>
+
+          <div data-roles="counselor">
+            <div class="section-title" id="request-section"><h2>소개 자료 발송</h2><span class="muted">매칭 성사 → 담당 상담이 "발송 요청" → 승인자가 승인하면 상대 회원이 받음</span></div>
+            <div class="notice">소개 자료는 직원이 올리지 않습니다. 회원 상세의 공개 동의 현황에서 <strong>발송 요청</strong>을 누르면 새 매칭 자료는 회원이 동의한 항목 중 직원이 선택한 심사 완료 결과만으로 생성합니다. 기존 제공 동의는 기존 반출 건의 관리용으로 유지합니다. 회원 코드·연락처·증빙 원본은 들어가지 않습니다.</div>
+            <p id="request-result" class="result" hidden></p>
+            <div class="section-title"><h2>내 발송 신청 내역</h2></div>
+            <div class="tablewrap">
+              <table>
+                <thead><tr><th>소개 자료</th><th>받는 회원</th><th>목적</th><th>상태</th><th>제공 기한</th><th>신청 시각</th></tr></thead>
+                <tbody id="requests-body"></tbody>
+              </table>
+              <div class="empty" id="requests-empty" hidden>신청 내역이 없습니다.</div>
+            </div>
+          </div>
+        </div><aside class="guide"><span class="eyebrow">STAFF GUIDE</span><h2>회원 조회</h2><ol><li><p>담당 관계가 있는 회원만 보입니다(총관리자는 전체). 연락처는 화면에 나오지 않습니다.</p></li><li><p>소개 자료는 서로 매칭해 동의가 있는 상대에게만 보낼 수 있습니다.</p></li><li><p>발송은 다른 승인자가 승인해야 상대에게 전달됩니다.</p></li><li><p>모든 조회·변경은 추적번호와 함께 감사 로그에 기록됩니다.</p></li></ol></aside></div>
+      </section>
+
+
+      <section class="view" data-view="manage" data-title="회원 관리" hidden>
+        <div class="page-heading"><div><span class="eyebrow">MEMBER ADMINISTRATION</span><h1>회원 관리</h1><p class="muted">회원 프로필(생년월일·키·몸무게·학력·직군·직장·소개)을 수정하고 탈퇴를 처리합니다. 상담 직원은 담당 회원만, 총관리자는 전체 회원을 관리합니다.</p></div></div>
+        <div class="stats">
+          <div><span class="small-label">관리 회원</span><strong id="stat-members">—</strong></div>
+          <div><span class="small-label">활동 중</span><strong id="stat-active">—</strong></div>
+          <div><span class="small-label">탈퇴 예정</span><strong id="stat-withdrawn">—</strong></div>
+          <div><span class="small-label">심사 대기 서류</span><strong id="stat-evidence">—</strong></div>
+        </div>
+        <div class="content-layout"><div class="work">
+          <div class="section-title"><h2>회원 정보</h2><span class="muted"><span id="manage-count"></span> · 새 회원은 담당 회원이 가장 적은 상담 직원에게 배정됩니다</span></div>
+          <div class="searchbar"><input type="search" id="manage-search" placeholder="회원 코드·이름·학력·직군·직장·담당 직원으로 검색" aria-label="회원 검색"></div>
+          <div class="tablewrap">
+            <table>
+              <thead id="manage-head"><tr><th data-sort="pseudo_id">회원</th><th data-sort="name">이름</th><th data-sort="gender">성별</th><th data-sort="age">나이</th><th data-sort="education_level">학력</th><th data-sort="job_group">직군 · 직장</th><th data-sort="verified">증빙</th><th data-sort="counselors">담당 직원</th><th data-sort="status">상태</th><th>관리</th></tr></thead>
+              <tbody id="manage-body"></tbody>
+            </table>
+            <div class="empty" id="manage-empty" hidden>회원이 없습니다.</div>
+          </div>
+          <div class="card mt16" id="edit-card" hidden>
+            <h3 id="edit-title">회원 정보 수정</h3>
+            <p class="muted">학력(구분·학교·전공)을 바꾸면 학력 증빙, 직장을 바꾸면 재직 증빙을 다시 심사해야 합니다. 연락처는 여기서 다루지 않습니다.</p>
+            <form class="form grid3" id="edit-form">
+              <input type="hidden" name="member_id">
+              <label>이름<input type="text" name="name" maxlength="40" required></label>
+              <label>성별<select name="gender"><option value="">선택</option><option>남</option><option>여</option></select></label>
+              <label>생년월일<input type="date" name="birth_date"></label>
+              <label>키(cm, 본인 신고)<input type="number" name="height_cm" min="120" max="230"></label>
+              <label>몸무게(kg, 본인 신고)<input type="number" name="weight_kg" min="30" max="200"></label>
+              <label>최종 학력<select name="education_level"><option value="">선택</option><option>고졸</option><option>전문대졸</option><option>4년제 대졸</option><option>대학원졸</option></select></label>
+              <label>학교<input type="text" name="school" maxlength="60"></label>
+              <label>전공<input type="text" name="major" maxlength="60"></label>
+              <label>직군<input type="text" name="job_group" maxlength="30"></label>
+              <label>직장<input type="text" name="company" maxlength="60"></label>
+              <label class="span-all">소개<input type="text" name="introduction" maxlength="200"></label>
+              <div class="actions span-all"><button type="submit" class="btn primary">저장</button><button type="button" class="btn" id="edit-cancel">취소</button></div>
+            </form>
+          </div>
+          <p id="manage-result" class="result" hidden></p>
+
+          <div data-roles="data_admin" class="export-block">
+            <div class="section-title"><h2>전체 회원 내보내기</h2></div>
+            <div class="card">
+              <div class="row-between">
+                <p class="muted">결과 파일은 서버 안에만 암호화해 보관하며 브라우저로 내려받지 않습니다. 외부 제공은 발송 신청과 별도 승인을 거쳐야 합니다.</p>
+                <button id="export-btn" type="button" class="btn primary">내보내기 실행</button>
+              </div>
+              <p id="export-result" class="result" hidden></p>
+            </div>
+            <div class="tablewrap">
+              <table>
+                <thead><tr><th>export_id</th><th>실행 직원</th><th>건수</th><th>중계 등록</th><th>실행 시각</th></tr></thead>
+                <tbody id="exports-body"></tbody>
+              </table>
+              <div class="empty" id="exports-empty" hidden>내보내기 내역이 없습니다.</div>
+            </div>
+          </div>
+        </div><aside class="guide"><span class="eyebrow">STAFF GUIDE</span><h2>회원 관리</h2><ol><li><p>연락처는 화면에 나오지 않습니다. 학력·직장을 바꾸면 해당 증빙을 다시 심사해야 합니다.</p></li><li><p>탈퇴는 7일 유예 후 회원 정보가 DB에서 삭제됩니다(그 전에는 철회 가능). 즉시 탈퇴는 바로 삭제되며 되돌릴 수 없습니다.</p></li><li><p>상담 직원의 내보내기 내역이 보이면 즉시 확인하세요(총관리자).</p></li><li><p>모든 조회·변경은 추적번호와 함께 감사 로그에 기록됩니다.</p></li></ol></aside></div>
+      </section>
+
+
+      <section class="view" data-view="evidence" data-title="회원·서류 심사" hidden>
+        <div class="page-heading"><div><span class="eyebrow">DOCUMENT REVIEW</span><h1>회원 · 서류 조회 · 심사 · 승인</h1><p class="muted">회원이 제출한 학력·재직·신분증·혼인관계·소득·부동산 서류와 프로필 사진을 자동 검사 결과(로컬 OCR·개인정보 탐지·발급대장 대조·마스킹 사본)와 함께 확인하고 통과 또는 반려합니다. 다른 회원에게는 통과한 서류의 요약(구간·여부)과 마스킹 사본만, 회원 동의와 승인을 거쳐 전달됩니다.</p></div></div>
+        <div class="content-layout"><div class="work">
+          <div class="section-title"><h2>제출 서류</h2>
+            <div class="filters" id="evidence-filters">
+              <button type="button" class="chip active" data-status="submitted,in_review">심사 대기</button>
+              <button type="button" class="chip" data-status="reviewed">심사 완료</button>
+              <button type="button" class="chip" data-status="">전체</button>
+            </div>
+          </div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>파일 이름</th><th>회원</th><th>이름</th><th>종류</th><th>접수</th><th>자동 검사</th><th>상태</th><th>심사자</th><th>삭제 기한</th><th>관리</th></tr></thead>
+              <tbody id="reviews-body"></tbody>
+            </table>
+            <div class="empty" id="reviews-empty" hidden>서류가 없습니다.</div>
+          </div>
+          <p id="reviews-result" class="result" hidden></p>
+          <div id="review-panel" class="card mt16 review-panel" hidden></div>
+        </div><aside class="guide"><span class="eyebrow">STAFF GUIDE</span><h2>서류 심사</h2><ol><li><p>심사 중인 서류만 열람할 수 있고, 처음 연 직원이 심사자로 기록됩니다.</p></li><li><p>열람한 서류를 저장하거나 외부로 옮기지 마세요.</p></li><li><p>원본은 심사 후 7일, 미심사 30일이 지나면 자동 삭제됩니다. 자동 검사 추출 값도 함께 지워지고, 통과 결과의 요약과 마스킹 사본만 남습니다.</p></li><li><p>자동 검사는 참고용입니다. 진위 "의심"이면 원본을 직접 확인하고, 공개 사실(구간·여부)은 직원이 최종 확정합니다.</p></li><li><p>신분증은 본인 확인용이며 사본을 만들지 않고 다른 회원에게 절대 제공되지 않습니다.</p></li><li><p>모든 조회·변경은 추적번호와 함께 감사 로그에 기록됩니다.</p></li></ol></aside></div>
+      </section>
+
+
+      <section class="view" data-view="approvals" data-title="소개 자료 발송 승인" hidden>
+        <div class="page-heading"><div><span class="eyebrow">DELIVERY APPROVAL</span><h1>소개 자료 발송 승인</h1><p class="muted">매칭된 회원에게 보내는 소개 자료 발송 신청을 확인하고 승인 또는 거절합니다. 본인이 신청한 건은 처리할 수 없습니다.</p></div></div>
+        <div class="content-layout"><div class="work">
+          <div class="section-title"><h2>발송 신청</h2>
+            <div class="filters" id="approval-filters">
+              <button type="button" class="chip active" data-status="">전체</button>
+              <button type="button" class="chip" data-status="pending">대기</button>
+              <button type="button" class="chip" data-status="approved">승인</button>
+              <button type="button" class="chip" data-status="rejected,revoked">거절·회수</button>
+            </div>
+          </div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>자료 (주인 → 받는 회원)</th><th>신청 직원</th><th>받는 회원</th><th>목적</th><th>상태</th><th>제공 기한</th><th>관리</th></tr></thead>
+              <tbody id="approvals-body"></tbody>
+            </table>
+            <div class="empty" id="approvals-empty" hidden>신청 내역이 없습니다.</div>
+          </div>
+
+          <div class="card mt16" id="request-detail" hidden>
+            <div class="row-between"><h2 id="detail-title">신청 심사</h2><span id="detail-status"></span></div>
+            <dl class="facts" id="detail-facts"></dl>
+            <h3>소개 자료 미리보기</h3>
+            <dl class="facts" id="detail-preview"></dl>
+            <div class="actions mt16" id="detail-actions"></div>
+          </div>
+          <p id="approvals-result" class="result" hidden></p>
+
+          <div class="card mt16">
+            <h3>승인 회수</h3>
+            <p class="muted">소개 자료 이름(예: A-001_file1)으로 회수합니다. 목록의 [회수] 버튼을 눌러도 됩니다. 회수하면 받는 회원은 더 이상 내려받을 수 없습니다.</p>
+            <form class="form inline" id="revoke-form">
+              <label>소개 자료 이름<input type="text" name="label" id="revoke-id" required placeholder="A-001_file1" pattern="[A-Za-z0-9-]{1,32}_file[0-9]{1,6}"></label>
+              <div><button type="submit" class="btn danger">회수</button></div>
+            </form>
+          </div>
+        </div><aside class="guide"><span class="eyebrow">STAFF GUIDE</span><h2>승인 기준</h2><ol><li><p>동의·파일 무결성·반출 기한은 서버가 다시 확인합니다.</p></li><li><p>미리보기의 내용이 신청 목적과 맞는지 확인하세요.</p></li><li><p>의심되는 신청은 거절하고, 이미 승인한 건은 회수하세요.</p></li><li><p>모든 조회·변경은 추적번호와 함께 감사 로그에 기록됩니다.</p></li></ol></aside></div>
+      </section>
+
+    </div>
+  </main>
+  <footer><span class="footer-brand">이음 결혼정보회사 · 내부 업무</span><span>PrivacyGate 개인정보 접근·반출 통제</span><span>가상 기업 · 교육용 시제품</span></footer>
+
+  <dialog id="confirm-dialog" class="confirm">
+    <form method="dialog">
+      <span class="eyebrow" id="confirm-eyebrow">CONFIRM</span>
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-message"></p>
+      <label id="confirm-input-wrap" class="confirm-input" hidden><span id="confirm-input-label">사유 (선택)</span>
+        <textarea id="confirm-input" maxlength="200" rows="3"></textarea></label>
+      <div class="actions" id="confirm-actions"></div>
+    </form>
+  </dialog>
+  <script src="/pager.js"></script>
+  <script src="/meeting-staff.js"></script>
+  <script src="/matching-staff.js"></script>
+  <script src="/staff-signup.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
